@@ -166,25 +166,45 @@ class ChartGenerator:
         x_axis = llm_config.get("xAxis", {})
         y_axis = llm_config.get("yAxis", {})
         
-        x_key = x_axis.get("dataKey", list(data[0].keys())[0] if data else "x")
-        y_key = y_axis.get("dataKey", list(data[0].keys())[1] if data and len(data[0]) > 1 else "y")
+        # Get actual column names from data
+        actual_columns = list(data[0].keys()) if data else []
+        
+        x_key = x_axis.get("dataKey", actual_columns[0] if actual_columns else "x")
+        y_key = y_axis.get("dataKey", actual_columns[1] if len(actual_columns) > 1 else "y")
+        
+        # Validate x_key exists in data
+        if x_key not in actual_columns and actual_columns:
+            logger.warning(f"xAxis dataKey '{x_key}' not found in data columns {actual_columns}, using first column")
+            x_key = actual_columns[0]
         
         # Process series from LLM
         series_config = []
         for i, series in enumerate(llm_config.get("series", [])):
+            data_key = series.get("dataKey", y_key)
+            
+            # Validate dataKey exists in actual data
+            if data_key not in actual_columns:
+                logger.warning(f"Series dataKey '{data_key}' not found in data columns {actual_columns}, skipping")
+                continue
+                
             series_config.append({
-                "dataKey": series.get("dataKey", y_key),
-                "name": series.get("name", self._format_label(series.get("dataKey", y_key))),
+                "dataKey": data_key,
+                "name": series.get("name", self._format_label(data_key)),
                 "color": series.get("color", self.colors[i % len(self.colors)]),
                 "fill": series.get("color", self.colors[i % len(self.colors)]),
                 "strokeDasharray": series.get("strokeDasharray")  # For forecast lines
             })
         
+        # If no valid series, auto-generate from numeric columns
+        if not series_config:
+            logger.info("No valid series from LLM config, auto-generating from data")
+            series_config = self._auto_generate_series(data, x_key)
+        
         return self.generate_config(
             chart_type=chart_type,
             data=data,
             x_axis_key=x_key,
-            y_axis_key=y_key,
+            y_axis_key=y_key if y_key in actual_columns else (series_config[0]["dataKey"] if series_config else "y"),
             title=title,
             series_config=series_config if series_config else None
         )

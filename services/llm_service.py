@@ -203,20 +203,26 @@ Available chart types:
 - pie: For part-to-whole relationships (use sparingly, max 6 segments)
 - scatter: For correlation analysis
 
+CRITICAL: For dataKey values, you MUST use the EXACT column names from the data, NOT friendly names.
+- If the data has column "average_rating", use "average_rating" as dataKey, NOT "Average Rating"
+- The "name" field can be a friendly display name, but "dataKey" MUST MATCH the exact column name
+
 Respond with a JSON object containing:
 - chartType: One of "line", "bar", "area", "pie", "scatter"
-- title: Chart title
-- xAxis: {dataKey: string, label: string} - the column for X axis
-- yAxis: {dataKey: string, label: string} - the column for Y axis (or value)
-- series: Array of {dataKey, name, color} for each data series
+- title: Chart title (friendly name)
+- xAxis: {dataKey: string (EXACT column name), label: string (display name)}
+- yAxis: {dataKey: string (EXACT column name), label: string (display name)}
+- series: Array of {dataKey: EXACT column name, name: friendly display name, color: hex color}
 - reasoning: Brief explanation of why this chart type was chosen"""
 
         user_prompt = f"""User query: "{user_query}"
 
-Columns available: {columns}
+Columns available (USE THESE EXACT NAMES for dataKey): {columns}
 
 Sample data:
 {json.dumps(sample_data, indent=2, default=str)}
+
+Remember: dataKey must use EXACT column names like "{columns[0] if columns else 'column_name'}", not friendly names.
 
 Recommend the best visualization."""
 
@@ -296,11 +302,24 @@ If you need clarification, ask specific questions."""
         system_prompt = """Classify the user's query intent for an LMS analytics system.
 
 Possible intents:
-- DATA_QUERY: User wants to retrieve/analyze data (e.g., "show me enrollments")
-- CHART_REQUEST: User explicitly wants a visualization (e.g., "graph of...")
+- OBJECTIVE: User wants to retrieve/analyze specific data from the database. Needs SQL to answer. (e.g., "show me enrollments", "list courses", "how many students")
+- CHART_REQUEST: User explicitly wants a visualization (e.g., "graph of...", "chart showing...")
+- EXPLANATORY: User wants reasoning, advice, explanations, or insights that DON'T require querying new data. Uses existing context + LLM reasoning. (e.g., "how to improve", "what should we do", "why did this happen")
 - FORECAST: User wants predictions/projections (e.g., "predict next month...")
-- CLARIFICATION: User is asking for help or clarification
-- GENERAL: General question not requiring data access
+- CLARIFICATION: User is asking for help or clarification about how to use the system
+- GENERAL: General greeting or off-topic question
+
+IMPORTANT: 
+- OBJECTIVE = needs to query database for facts
+- EXPLANATORY = reasoning from existing context (advisory, diagnostic, why questions)
+
+Examples:
+- "Show me enrollment trends" → OBJECTIVE
+- "How can we boost enrollments during low periods?" → EXPLANATORY
+- "What strategies should we use to increase student retention?" → EXPLANATORY
+- "List all courses" → OBJECTIVE
+- "Why are enrollments dropping?" → EXPLANATORY (needs reasoning, not just data)
+- "What does this trend tell us?" → EXPLANATORY
 
 Respond with JSON: {intent, confidence, reasoning}"""
 
@@ -325,3 +344,333 @@ Respond with JSON: {intent, confidence, reasoning}"""
                 "confidence": "LOW",
                 "reasoning": "Fallback classification due to error"
             }
+    
+    def analyze_and_fix_sql(self, failed_sql: str, error_message: str, 
+                            original_query: str, schema: str) -> Dict[str, Any]:
+        """
+        Analyze a failed SQL query and generate a corrected version.
+        
+        Args:
+            failed_sql: The SQL query that failed
+            error_message: The error message from the database
+            original_query: The original user query
+            schema: Database schema for context
+            
+        Returns:
+            Dictionary with corrected SQL and explanation
+        """
+        system_prompt = """You are a SQL debugging expert. A SQL query has failed execution.
+Your job is to:
+1. Analyze the error message to understand WHY it failed
+2. Look at the schema to find the CORRECT column/table names
+3. Generate a FIXED SQL query that will work
+
+COMMON ERRORS AND FIXES:
+- "Unknown column 'x'": The column name is wrong. Find the correct column name in the schema.
+- "Table doesn't exist": The table name is wrong. Use exact table names from schema.
+- "Syntax error": Fix the SQL syntax.
+- "Data truncated": Check data types and constraints.
+
+CRITICAL RULES:
+1. Use ONLY columns that exist in the schema
+2. Use EXACT column names as shown in the schema (case-sensitive)
+3. Do NOT invent columns - if you can't find a matching column, explain why
+
+Respond with JSON:
+{
+    "fixed_sql": "The corrected SQL query",
+    "error_analysis": "Brief explanation of what was wrong",
+    "fix_applied": "What was changed to fix it",
+    "confidence": "HIGH" | "MEDIUM" | "LOW",
+    "can_fix": true | false
+}
+
+If you cannot fix the query (e.g., required data doesn't exist), set can_fix to false and explain why."""
+
+        user_prompt = f"""FAILED SQL:
+```sql
+{failed_sql}
+```
+
+ERROR MESSAGE:
+{error_message}
+
+ORIGINAL USER QUERY:
+{original_query}
+
+DATABASE SCHEMA:
+{schema}
+
+Analyze the error and provide a corrected SQL query."""
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.1,  # Low temperature for precise fixes
+                max_tokens=1000
+            )
+            
+            result = json.loads(response.choices[0].message.content)
+            logger.info(f"SQL fix analysis: {result.get('error_analysis', 'No analysis')}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"SQL fix analysis error: {e}")
+            return {
+                "fixed_sql": None,
+                "error_analysis": f"Could not analyze error: {str(e)}",
+                "fix_applied": None,
+                "confidence": "LOW",
+                "can_fix": False
+            }
+    
+    def generate_advisory_response(self, user_query: str, conversation_context: str) -> Dict[str, Any]:
+        """
+        Generate strategic advice and recommendations based on conversation context.
+        Used for ADVISORY intent queries that don't need new SQL queries.
+        
+        Args:
+            user_query: The advisory question from the user
+            conversation_context: Previous conversation including data results
+            
+        Returns:
+            Dictionary with advice, recommendations, and optional action items
+        """
+        system_prompt = """You are a strategic analytics advisor for a Learning Management System.
+The user is asking for advice or recommendations based on data they've already seen in this conversation.
+
+Your job is to:
+1. Analyze the question in context of the available data
+2. Provide strategic, actionable recommendations
+3. Be specific - reference actual numbers/trends from the context
+4. Structure your response clearly
+
+Response format (JSON):
+{
+    "summary": "Brief 1-2 sentence executive summary of your advice",
+    "key_insight": "The most important finding that drives your recommendation",
+    "recommendations": [
+        {
+            "title": "Short action title",
+            "description": "Detailed explanation of what to do and why",
+            "priority": "HIGH" | "MEDIUM" | "LOW",
+            "expected_impact": "What improvement to expect"
+        }
+    ],
+    "reasoning": "Brief explanation of how you arrived at these recommendations based on the data"
+}
+
+Be practical and specific. Avoid generic advice. Reference actual data from the conversation."""
+
+        user_prompt = f"""Question: {user_query}
+
+CONVERSATION CONTEXT (including previous data and insights):
+{conversation_context}
+
+Based on the above context, provide strategic recommendations."""
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.7,  # Slightly higher for creative recommendations
+                max_tokens=1000
+            )
+            
+            result = json.loads(response.choices[0].message.content)
+            logger.info(f"Generated advisory response with {len(result.get('recommendations', []))} recommendations")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Advisory response generation error: {e}")
+            return {
+                "summary": "I apologize, but I couldn't generate recommendations at this time.",
+                "key_insight": "Please try rephrasing your question.",
+                "recommendations": [],
+                "reasoning": f"Error: {str(e)}"
+            }
+    
+    def generate_follow_up_suggestions(self, user_query: str, sql_query: str, 
+                                       data_summary: str, insights: List[str]) -> Dict[str, Any]:
+        """
+        Generate context-aware follow-up question suggestions based on the current query and results.
+        
+        Args:
+            user_query: Original user query
+            sql_query: The SQL query that was executed
+            data_summary: Summary of the data returned
+            insights: Key insights generated
+            
+        Returns:
+            Dictionary with categorized follow-up suggestions
+        """
+        system_prompt = """You are an expert data analyst assistant for an LMS (Learning Management System).
+Based on the user's query and the results, suggest follow-up questions they might want to ask.
+
+Generate suggestions in THREE categories:
+1. DRILL_DEEPER: Questions that explore the data in more detail (type: "data")
+2. COMPARE: Questions that compare with other time periods, segments, or benchmarks (type: "data")
+3. ACTION: Questions about strategy, improvements, or "how to" advice (type: "advisory")
+
+RULES:
+- Each category should have 2 suggestions maximum
+- Suggestions should be SHORT (under 8 words)
+- Suggestions should be natural follow-ups to what was just shown
+- Make them specific to the current context, not generic
+- "data" type = needs new database query
+- "advisory" type = strategic advice question (no SQL needed)
+
+Respond with JSON:
+{
+  "categories": [
+    {
+      "name": "Drill Deeper",
+      "icon": "📊",
+      "suggestions": [
+        {"text": "Short label", "query": "Full natural language query", "type": "data"}
+      ]
+    },
+    {
+      "name": "Compare",
+      "icon": "🔍",
+      "suggestions": [
+        {"text": "vs last year", "query": "Compare with last year", "type": "data"}
+      ]
+    },
+    {
+      "name": "Take Action", 
+      "icon": "🎯",
+      "suggestions": [
+        {"text": "How to improve", "query": "How can we improve these numbers?", "type": "advisory"}
+      ]
+    }
+  ]
+}"""
+
+        user_prompt = f"""User asked: "{user_query}"
+
+SQL Query executed:
+{sql_query}
+
+Data Summary: {data_summary}
+
+Key Insights: {', '.join(insights[:3]) if insights else 'No specific insights'}
+
+Generate relevant follow-up suggestions for this context."""
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.7,  # Slightly higher for creative suggestions
+                max_tokens=500
+            )
+            
+            result = json.loads(response.choices[0].message.content)
+            logger.info(f"Generated {len(result.get('categories', []))} suggestion categories")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Follow-up suggestion generation error: {e}")
+            # Return default suggestions on error
+            return {
+                "categories": [
+                    {
+                        "name": "Drill Deeper",
+                        "icon": "📊",
+                        "suggestions": [
+                            {"text": "Show by category", "query": "Break this down by category"},
+                            {"text": "Top performers", "query": "Show the top 5 performers"}
+                        ]
+                    },
+                    {
+                        "name": "Compare",
+                        "icon": "🔍",
+                        "suggestions": [
+                            {"text": "vs last month", "query": "Compare with last month"},
+                            {"text": "Trend over time", "query": "Show the trend over the last 6 months"}
+                        ]
+                    }
+                ]
+            }
+
+    def detect_query_ambiguity(self, user_query: str, schema_context: str) -> Dict[str, Any]:
+        """
+        Detect if a user query is ambiguous and needs clarification.
+        
+        Args:
+            user_query: The user's natural language query
+            schema_context: Available database schema for context
+            
+        Returns:
+            Dictionary with ambiguity detection results and clarification options
+        """
+        system_prompt = """You are an expert at understanding user intent for LMS analytics queries.
+
+Analyze if the user's query is AMBIGUOUS and needs clarification before generating SQL.
+
+A query is ambiguous if:
+1. TIME RANGE is unclear (e.g., "recent", "top", without specifying period)
+2. METRIC is unclear (e.g., "performance" could mean completion rate, grades, or engagement)
+3. SCOPE is unclear (e.g., "students" could mean all, active, or specific cohort)
+4. COMPARISON is implied but not specified (e.g., "how are we doing" - compared to what?)
+
+If the query IS clear enough to proceed, return:
+{"needs_clarification": false, "confidence": "HIGH", "reasoning": "..."}
+
+If clarification needed, return:
+{
+  "needs_clarification": true,
+  "confidence": "MEDIUM" or "LOW",
+  "reasoning": "Brief explanation",
+  "clarification": {
+    "question": "The question to ask user",
+    "type": "time_range" | "metric" | "scope" | "comparison",
+    "options": [
+      {"id": "option1", "icon": "📅", "label": "This month"},
+      {"id": "option2", "icon": "📆", "label": "This quarter"},
+      ...
+    ],
+    "default": "option1"
+  }
+}
+
+Be practical - don't ask for clarification if reasonable defaults exist."""
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"Query: \"{user_query}\"\n\nAvailable tables: {schema_context[:1000]}"}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.1,
+                max_tokens=400
+            )
+            
+            result = json.loads(response.choices[0].message.content)
+            logger.info(f"Ambiguity check: needs_clarification={result.get('needs_clarification', False)}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Ambiguity detection error: {e}")
+            return {
+                "needs_clarification": False,
+                "confidence": "MEDIUM",
+                "reasoning": "Proceeding with defaults due to detection error"
+            }
+

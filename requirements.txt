@@ -3,8 +3,9 @@ fastapi==0.109.0
 uvicorn[standard]==0.27.0
 sse-starlette==2.0.0
 
-# OpenAI
+# OpenAI - pinned with compatible httpx
 openai==1.12.0
+httpx==0.27.0
 
 # Database
 mysql-connector-python==8.3.0
@@ -16,8 +17,9 @@ numpy==1.26.3
 
 # Environment & Settings
 python-dotenv==1.0.0
-pydantic==2.6.0
+pydantic==2.5.3
 pydantic-settings==2.1.0
+pydantic-core==2.14.6
 
 # CORS
 python-multipart==0.0.6
