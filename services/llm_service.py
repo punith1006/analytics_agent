@@ -500,7 +500,10 @@ Based on the above context, provide strategic recommendations."""
             }
     
     def generate_follow_up_suggestions(self, user_query: str, sql_query: str, 
-                                       data_summary: str, insights: List[str]) -> Dict[str, Any]:
+                                       data_summary: str, insights: List[str],
+                                       columns: List[str] = None,
+                                       row_count: int = 0,
+                                       data_time_range: str = None) -> Dict[str, Any]:
         """
         Generate context-aware follow-up question suggestions based on the current query and results.
         
@@ -509,25 +512,43 @@ Based on the above context, provide strategic recommendations."""
             sql_query: The SQL query that was executed
             data_summary: Summary of the data returned
             insights: Key insights generated
+            columns: Available columns in the result (for schema awareness)
+            row_count: Number of rows returned (for conditional display)
+            data_time_range: Time range of data if applicable (e.g., "Jan 2024 - Dec 2024")
             
         Returns:
             Dictionary with categorized follow-up suggestions
         """
+        # Skip suggestions for single-value or empty results
+        if row_count <= 1:
+            logger.info(f"Skipping suggestions for simple result (row_count={row_count})")
+            return {"categories": [], "skip_reason": "single_value_result"}
+        
+        # Build context for schema-aware suggestions
+        columns_info = f"Available columns: {', '.join(columns)}" if columns else ""
+        time_range_info = f"Data time range: {data_time_range}" if data_time_range else "Time range: unknown"
+        
         system_prompt = """You are an expert data analyst assistant for an LMS (Learning Management System).
 Based on the user's query and the results, suggest follow-up questions they might want to ask.
 
 Generate suggestions in THREE categories:
-1. DRILL_DEEPER: Questions that explore the data in more detail (type: "data")
-2. COMPARE: Questions that compare with other time periods, segments, or benchmarks (type: "data")
-3. ACTION: Questions about strategy, improvements, or "how to" advice (type: "advisory")
+1. DRILL_DEEPER: Questions that explore the data in more detail (type: "objective")
+2. COMPARE: Questions that compare with other time periods, segments, or benchmarks (type: "objective")
+3. ACTION: Questions about strategy, improvements, or "how to" advice (type: "explanatory")
 
-RULES:
-- Each category should have 2 suggestions maximum
-- Suggestions should be SHORT (under 8 words)
-- Suggestions should be natural follow-ups to what was just shown
-- Make them specific to the current context, not generic
-- "data" type = needs new database query
-- "advisory" type = strategic advice question (no SQL needed)
+CRITICAL RULES:
+- Each category should have 1-2 suggestions maximum
+- Suggestions should be SHORT (under 8 words for the label)
+- Suggestions MUST be specific to the current data context
+- DO NOT suggest generic questions like "Show by category" if the data doesn't have categories
+- DO NOT suggest time comparisons if the data time range doesn't support it
+- Only suggest drilling into dimensions that exist in the available columns
+- If you can't generate relevant suggestions for a category, leave it empty
+
+QUALITY CHECKS:
+- "Compare with last year" → Only if data range spans multiple years
+- "Break down by X" → Only if column X exists in the data
+- "How to improve" → Always valid as an explanatory question
 
 Respond with JSON:
 {
@@ -536,36 +557,40 @@ Respond with JSON:
       "name": "Drill Deeper",
       "icon": "📊",
       "suggestions": [
-        {"text": "Short label", "query": "Full natural language query", "type": "data"}
+        {"text": "Short label", "query": "Full natural language query", "type": "objective"}
       ]
     },
     {
       "name": "Compare",
       "icon": "🔍",
       "suggestions": [
-        {"text": "vs last year", "query": "Compare with last year", "type": "data"}
+        {"text": "vs last month", "query": "Compare with last month", "type": "objective"}
       ]
     },
     {
       "name": "Take Action", 
       "icon": "🎯",
       "suggestions": [
-        {"text": "How to improve", "query": "How can we improve these numbers?", "type": "advisory"}
+        {"text": "How to improve", "query": "How can we improve these numbers?", "type": "explanatory"}
       ]
     }
   ]
-}"""
+}
+
+If a category has no relevant suggestions, return it with an empty suggestions array."""
 
         user_prompt = f"""User asked: "{user_query}"
 
 SQL Query executed:
 {sql_query}
 
-Data Summary: {data_summary}
+Data Summary: {data_summary} ({row_count} rows)
+{columns_info}
+{time_range_info}
 
 Key Insights: {', '.join(insights[:3]) if insights else 'No specific insights'}
 
-Generate relevant follow-up suggestions for this context."""
+Generate relevant, specific follow-up suggestions. Do NOT include generic suggestions that don't fit the data."""
 
         try:
             response = self.client.chat.completions.create(
@@ -575,36 +600,28 @@ Generate relevant follow-up suggestions for this context."""
                     {"role": "user", "content": user_prompt}
                 ],
                 response_format={"type": "json_object"},
-                temperature=0.7,  # Slightly higher for creative suggestions
+                temperature=0.5,  # Balanced for relevance
                 max_tokens=500
             )
             
             result = json.loads(response.choices[0].message.content)
+            
+            # Filter out empty categories
+            if "categories" in result:
+                result["categories"] = [
+                    cat for cat in result["categories"] 
+                    if cat.get("suggestions") and len(cat["suggestions"]) > 0
+                ]
+            
             logger.info(f"Generated {len(result.get('categories', []))} suggestion categories")
             return result
             
         except Exception as e:
             logger.error(f"Follow-up suggestion generation error: {e}")
-            # Return default suggestions on error
+            # Return empty instead of generic suggestions
             return {
-                "categories": [
-                    {
-                        "name": "Drill Deeper",
-                        "icon": "📊",
-                        "suggestions": [
-                            {"text": "Show by category", "query": "Break this down by category"},
-                            {"text": "Top performers", "query": "Show the top 5 performers"}
-                        ]
-                    },
-                    {
-                        "name": "Compare",
-                        "icon": "🔍",
-                        "suggestions": [
-                            {"text": "vs last month", "query": "Compare with last month"},
-                            {"text": "Trend over time", "query": "Show the trend over the last 6 months"}
-                        ]
-                    }
-                ]
+                "categories": [],
+                "error": str(e)
             }
 
     def detect_query_ambiguity(self, user_query: str, schema_context: str) -> Dict[str, Any]:

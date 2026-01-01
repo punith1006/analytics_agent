@@ -406,17 +406,31 @@ async def analytics_chat(request: ChatRequest):
             # Step 6: Generate follow-up suggestions
             await asyncio.sleep(0.1)
             
-            # Create data summary for suggestions
+            # Create data summary and extract time range if present
+            columns = list(data[0].keys()) if data else []
             data_summary = f"{row_count} rows returned"
-            if data:
-                columns = list(data[0].keys())
+            if columns:
                 data_summary += f" with columns: {', '.join(columns[:5])}"
             
+            # Try to detect time range from data if there's a date column
+            data_time_range = None
+            date_columns = [c for c in columns if 'date' in c.lower() or 'time' in c.lower() or 'month' in c.lower() or 'year' in c.lower()]
+            if date_columns and data:
+                try:
+                    first_val = str(data[0].get(date_columns[0], ""))
+                    last_val = str(data[-1].get(date_columns[0], "")) if len(data) > 1 else first_val
+                    data_time_range = f"{first_val} to {last_val}"
+                except:
+                    pass
+            
             suggestions = llm_service.generate_follow_up_suggestions(
-                user_query,
-                sql_result.get("sql", ""),
-                data_summary,
-                insights.get("insights", [])
+                user_query=user_query,
+                sql_query=sql_result.get("sql", ""),
+                data_summary=data_summary,
+                insights=insights.get("insights", []),
+                columns=columns,
+                row_count=row_count,
+                data_time_range=data_time_range
             )
             
             yield {
