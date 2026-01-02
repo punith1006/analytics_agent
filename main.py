@@ -23,6 +23,8 @@ from services.sql_executor import SQLExecutor, SQLValidationError, SQLExecutionE
 from services.llm_service import LLMService
 from services.chart_generator import ChartGenerator
 from services.conversation_manager import conversation_manager
+from services.drill_down_service import drill_down_service
+from services.narrative_service import narrative_service
 
 # Configure logging
 logging.basicConfig(
@@ -87,6 +89,15 @@ class SchemaResponse(BaseModel):
     tables: dict
 
 
+class DrillDownRequest(BaseModel):
+    """Drill-down request model for chart interactions"""
+    clicked_element: dict  # {dimension, value, label, rawData}
+    drill_option: Optional[dict] = None  # {id, drill_type, target_dimension}
+    current_context: dict  # {sql_query, columns, tables_used}
+    conversation_id: Optional[str] = None
+    breadcrumb: Optional[list] = []
+
+
 # Health check endpoint
 @app.get("/health")
 async def health_check():
@@ -107,6 +118,181 @@ async def get_schema():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# Drill-down options endpoint
+@app.post("/api/analytics/drill-options")
+async def get_drill_options(request: DrillDownRequest):
+    """
+    Get available drill-down options for a clicked chart element.
+    Returns options like: breakdown, trend, compare, details
+    """
+    try:
+        options = drill_down_service.get_drill_options(
+            clicked_element=request.clicked_element,
+            current_context=request.current_context
+        )
+        return {
+            "options": options,
+            "clicked": request.clicked_element,
+            "breadcrumb": request.breadcrumb
+        }
+    except Exception as e:
+        logger.error(f"Drill options error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Drill-down execution endpoint with SSE
+@app.post("/api/analytics/drill-down")
+async def execute_drill_down(request: DrillDownRequest):
+    """
+    Execute a drill-down query and stream results via SSE.
+    Similar to main chat but for chart interactions.
+    """
+    async def event_generator():
+        try:
+            conversation_id = request.conversation_id or "default"
+            clicked = request.clicked_element
+            drill_option = request.drill_option or {"drill_type": "breakdown"}
+            
+            logger.info(f"Drill-down: {clicked.get('label')} -> {drill_option.get('drill_type')}")
+            
+            # Step 1: Thinking
+            yield {
+                "event": "thinking",
+                "data": json.dumps({
+                    "status": f"Drilling into {clicked.get('label', 'data')}...",
+                    "step": 1,
+                    "total_steps": 4
+                })
+            }
+            await asyncio.sleep(0.1)
+            
+            # Step 2: Generate drill-down SQL
+            schema_for_llm = schema_service.get_schema_for_llm()
+            
+            drill_result = drill_down_service.generate_drill_query(
+                clicked_element=clicked,
+                drill_option=drill_option,
+                current_context=request.current_context,
+                schema=schema_for_llm
+            )
+            
+            if not drill_result.get("sql"):
+                yield {
+                    "event": "error",
+                    "data": json.dumps({
+                        "message": "Couldn't generate drill-down query",
+                        "details": drill_result.get("error", "Unknown error")
+                    })
+                }
+                return
+            
+            yield {
+                "event": "sql_generated",
+                "data": json.dumps({
+                    "sql": drill_result["sql"],
+                    "explanation": drill_result.get("explanation", ""),
+                    "drill_context": drill_result.get("drill_context", {})
+                })
+            }
+            await asyncio.sleep(0.1)
+            
+            # Step 3: Execute query
+            yield {
+                "event": "thinking",
+                "data": json.dumps({
+                    "status": "Retrieving drill-down data...",
+                    "step": 2,
+                    "total_steps": 4
+                })
+            }
+            
+            query_result = sql_executor.execute_query(drill_result["sql"])
+            if query_result is None:
+                yield {
+                    "event": "error",
+                    "data": json.dumps({
+                        "message": "Failed to execute drill-down query"
+                    })
+                }
+                return
+            
+            data = query_result["data"]
+            row_count = query_result["row_count"]
+            
+            yield {
+                "event": "data_retrieved",
+                "data": json.dumps({
+                    "row_count": row_count,
+                    "preview": data[:10] if data else [],
+                    "columns": list(data[0].keys()) if data else []
+                })
+            }
+            await asyncio.sleep(0.1)
+            
+            # Step 4: Generate visualization
+            yield {
+                "event": "thinking",
+                "data": json.dumps({
+                    "status": "Creating drill-down visualization...",
+                    "step": 3,
+                    "total_steps": 4
+                })
+            }
+            
+            if data:
+                columns = list(data[0].keys())
+                chart_config = llm_service.determine_chart_type(
+                    f"Drill-down: {clicked.get('label')} by {drill_option.get('target_dimension', 'details')}",
+                    data[:20],
+                    columns
+                )
+                
+                full_chart_config = chart_generator.prepare_chart_data(
+                    chart_config=chart_config,
+                    data=data,
+                    columns=columns
+                )
+                
+                # Update title for drill-down context
+                if full_chart_config:
+                    full_chart_config["title"] = drill_result.get("title", full_chart_config.get("title", "Drill-Down Results"))
+                
+                yield {
+                    "event": "visualization",
+                    "data": json.dumps({
+                        "chartConfig": full_chart_config
+                    })
+                }
+            
+            # Build updated breadcrumb
+            new_breadcrumb = drill_down_service.build_breadcrumb(
+                request.breadcrumb or [],
+                {**clicked, "drill_type": drill_option.get("drill_type")}
+            )
+            
+            # Complete
+            yield {
+                "event": "complete",
+                "data": json.dumps({
+                    "status": "done",
+                    "breadcrumb": new_breadcrumb,
+                    "can_drill_further": row_count > 1
+                })
+            }
+            
+        except Exception as e:
+            logger.error(f"Drill-down error: {e}", exc_info=True)
+            yield {
+                "event": "error",
+                "data": json.dumps({
+                    "message": "Drill-down failed",
+                    "details": str(e)
+                })
+            }
+    
+    return EventSourceResponse(event_generator())
 
 
 # Main chat endpoint with SSE
@@ -199,8 +385,46 @@ async def analytics_chat(request: ChatRequest):
                 }
                 return
             
+            # =========== AMBIGUITY CHECK ===========
+            # Check if query needs clarification before generating SQL
+            schema_for_llm = schema_service.get_schema_for_llm()
+            
+            ambiguity_result = llm_service.detect_query_ambiguity(user_query, schema_for_llm[:2000])
+            
+            if ambiguity_result.get("needs_clarification", False):
+                logger.info(f"Query needs clarification: {ambiguity_result.get('reasoning')}")
+                
+                clarification = ambiguity_result.get("clarification", {})
+                yield {
+                    "event": "clarification_needed",
+                    "data": json.dumps({
+                        "question": clarification.get("question", "Could you please clarify your request?"),
+                        "options": clarification.get("options", []),
+                        "default": clarification.get("default"),
+                        "type": clarification.get("type", "general"),
+                        "reasoning": ambiguity_result.get("reasoning", "")
+                    })
+                }
+                
+                # Track this in conversation
+                conversation_manager.add_assistant_message(
+                    conversation_id,
+                    f"Asked for clarification: {clarification.get('question', '')}",
+                    sql_query=None,
+                    data_summary="Awaiting user clarification"
+                )
+                
+                yield {
+                    "event": "complete",
+                    "data": json.dumps({
+                        "status": "awaiting_clarification",
+                        "query_id": conversation_id
+                    })
+                }
+                return
+            
             # =========== DATA QUERY PATH ===========
-            # Step 2: Get schema and generate SQL (with conversation context)
+            # Step 2: Generate SQL (with conversation context)
             yield {
                 "event": "thinking",
                 "data": json.dumps({
@@ -211,7 +435,6 @@ async def analytics_chat(request: ChatRequest):
             }
             await asyncio.sleep(0.1)
             
-            schema_for_llm = schema_service.get_schema_for_llm()
             
             # Include conversation context for better follow-up handling
             if conversation_context:
@@ -402,6 +625,40 @@ async def analytics_chat(request: ChatRequest):
                         "reasoning": chart_config.get("reasoning", "")
                     })
                 }
+            
+            # Step 5.5: Generate narrative/data story (for complex queries)
+            await asyncio.sleep(0.1)
+            
+            # Determine query type from user query
+            query_type = user_query
+            
+            # GENERATE NARRATIVE ONLY ON EXPLICIT REQUEST
+            explicit_narrative_request = "story" in user_query.lower() or "narrative" in user_query.lower() or "explain" in user_query.lower()
+            
+            if data and explicit_narrative_request:
+                yield {
+                    "event": "thinking",
+                    "data": json.dumps({
+                        "status": "Generating data story...",
+                        "step": 5,
+                        "total_steps": 6
+                    })
+                }
+                
+                narrative = narrative_service.generate_narrative(
+                    user_query=user_query,
+                    data=data[:50],  # Limit to first 50 rows
+                    sql_query=sql_result.get("sql", ""),
+                    insights=insights,
+                    columns=list(data[0].keys()) if data else [],
+                    row_count=row_count
+                )
+                
+                if narrative.get("should_display", False):
+                    yield {
+                        "event": "narrative",
+                        "data": json.dumps(narrative)
+                    }
             
             # Step 6: Generate follow-up suggestions
             await asyncio.sleep(0.1)

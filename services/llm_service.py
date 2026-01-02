@@ -52,6 +52,10 @@ RULES:
 6. Always include a reasonable LIMIT clause (max 1000 rows)
 7. Handle NULL values appropriately
 8. Add comments explaining complex logic
+9. CRITICAL: For string comparisons (titles, names, descriptions), ALWAYS use `LIKE` with wildcards (e.g. `LIKE '%Search Term%'`) instead of exact `=` match.
+10. SEARCH STRATEGY: If the user search term seems like an abbreviation or partial name, use broad `LIKE` patterns.
+    - Example: "prompt eng" -> `title LIKE '%Prompt%' AND title LIKE '%Eng%'`
+    - Example: "ML" -> `title LIKE '%ML%'` OR `title LIKE '%Machine Learning%'`
 
 IMPORTANT SEMANTIC MAPPINGS:
 - "students", "users", "learners" -> usercredential table
